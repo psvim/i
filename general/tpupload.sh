@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# Catbox / TempFile Uploader - Upload Files from cli and share easily.
+set -u
+
+clear
+
+echo "======================================"
+echo "       Catbox / TempFile Uploader"
+echo "======================================"
+echo
+
+if ! command -v curl >/dev/null 2>&1; then
+    echo "ERROR: curl is not installed."
+    exit 1
+fi
+
+# --------------------------------------
+# Upload service
+# --------------------------------------
+
+echo "Upload service:"
+echo
+echo "1. Catbox    (permanent) - 200 MB per file"
+echo "2. TempFile (temporary) - 100 MB per file, up to 20 files"
+echo
+
+read -r -p "Select [1-2]: " SERVICE
+
+case "$SERVICE" in
+    1)
+        API_URL="https://catbox.moe/user/api.php"
+        SERVICE_NAME="Catbox"
+        ;;
+    2)
+        API_URL="https://tempfile.org/api/upload/local"
+        SERVICE_NAME="TempFile"
+
+        echo
+        echo "TempFile expiration:"
+        echo
+        echo "1. 1 hour"
+        echo "2. 6 hours"
+        echo "3. 24 hours"
+        echo "4. 48 hours"
+        echo
+
+        read -r -p "Select [1-4]: " EXPIRATION
+
+        case "$EXPIRATION" in
+            1) TIME="1" ;;
+            2) TIME="6" ;;
+            3) TIME="24" ;;
+            4) TIME="48" ;;
+            *)
+                echo "Invalid expiration."
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "Invalid service."
+        exit 1
+        ;;
+esac
+
+# --------------------------------------
+# Folder
+# --------------------------------------
+
+echo
+read -r -p "Folder: " TARGET
+
+TARGET="${TARGET/#\~/$HOME}"
+
+if [ ! -d "$TARGET" ]; then
+    echo
+    echo "ERROR: Folder does not exist."
+    exit 1
+fi
+
+# --------------------------------------
+# Extensions
+# --------------------------------------
+
+echo
+read -r -p "File extensions (e.g. pdf odt xlsx): " EXTENSIONS
+
+if [ -z "$EXTENSIONS" ]; then
+    echo
+    echo "ERROR: No extensions specified."
+    exit 1
+fi
+
+# --------------------------------------
+# Recursive search
+# --------------------------------------
+
+echo
+read -r -p "Search subdirectories recursively? [Y/n]: " RECURSIVE
+RECURSIVE="${RECURSIVE:-Y}"
+
+# --------------------------------------
+# Build find arguments
+# --------------------------------------
+
+FIND_ARGS=()
+
+if [[ "$RECURSIVE" =~ ^[Yy]$ ]]; then
+    FIND_ARGS+=("$TARGET")
+else
+    FIND_ARGS+=("$TARGET" -maxdepth 1)
+fi
+
+FIND_ARGS+=(-type f '(')
+
+FIRST=1
+
+for ext in $EXTENSIONS; do
+    ext="${ext#.}"
+
+    if [ "$FIRST" -eq 0 ]; then
+        FIND_ARGS+=(-o)
+    fi
+
+    FIND_ARGS+=(-iname "*.${ext}")
+    FIRST=0
+done
+
+FIND_ARGS+=(\))
+
+# --------------------------------------
+# Find files
+# --------------------------------------
+
+mapfile -d '' FILES < <(
+    find "${FIND_ARGS[@]}" -print0
+)
+
+TOTAL=${#FILES[@]}
+
+echo
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo "No matching files found."
+    exit 0
+fi
+
+echo "Found $TOTAL matching file(s):"
+echo
+
+# --------------------------------------
+# Display numbered files
+# --------------------------------------
+
+for ((i=0; i<TOTAL; i++)); do
+    NUM=$((i + 1))
+    DISPLAY="${FILES[$i]}"
+
+    if [[ "$DISPLAY" == "$TARGET/"* ]]; then
+        DISPLAY="${DISPLAY#"$TARGET"/}"
+    fi
+
+    printf "%3d. %s\n" "$NUM" "$DISPLAY"
+done
+
+echo
+echo "======================================"
+echo "Select files to upload"
+echo "======================================"
+echo
+echo "Examples:"
+echo "  1"
+echo "  1,3,5"
+echo "  1,3,7-10"
+echo "  all"
+echo
+
+read -r -p "Selection: " SELECTION
+
+SELECTION="${SELECTION// /}"
+
+if [ -z "$SELECTION" ]; then
+    echo "No files selected."
+    exit 0
+fi
+
+# --------------------------------------
+# Selection handling
+# --------------------------------------
+
+SELECTED=()
+
+if [[ "$SELECTION" =~ ^[Aa][Ll][Ll]$ ]]; then
+    for ((i=0; i<TOTAL; i++)); do
+        SELECTED+=("$i")
+    done
+else
+    IFS=',' read -ra PARTS <<< "$SELECTION"
+
+    for PART in "${PARTS[@]}"; do
+
+        if [[ "$PART" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            START="${BASH_REMATCH[1]}"
+            END="${BASH_REMATCH[2]}"
+
+            if [ "$START" -gt "$END" ]; then
+                TMP="$START"
+                START="$END"
+                END="$TMP"
+            fi
+
+            for ((n=START; n<=END; n++)); do
+                if [ "$n" -ge 1 ] && [ "$n" -le "$TOTAL" ]; then
+                    SELECTED+=("$((n - 1))")
+                else
+                    echo "Invalid selection: $n"
+                    exit 1
+                fi
+            done
+
+        elif [[ "$PART" =~ ^[0-9]+$ ]]; then
+            if [ "$PART" -ge 1 ] && [ "$PART" -le "$TOTAL" ]; then
+                SELECTED+=("$((PART - 1))")
+            else
+                echo "Invalid selection: $PART"
+                exit 1
+            fi
+
+        else
+            echo "Invalid selection: $PART"
+            exit 1
+        fi
+    done
+fi
+
+# --------------------------------------
+# Remove duplicate selections
+# --------------------------------------
+
+UNIQUE_SELECTED=()
+declare -A SEEN
+
+for INDEX in "${SELECTED[@]}"; do
+    if [[ -z "${SEEN[$INDEX]+x}" ]]; then
+        SEEN[$INDEX]=1
+        UNIQUE_SELECTED+=("$INDEX")
+    fi
+done
+
+SELECTED=("${UNIQUE_SELECTED[@]}")
+SELECTED_COUNT=${#SELECTED[@]}
+
+if [ "$SELECTED_COUNT" -eq 0 ]; then
+    echo "No valid files selected."
+    exit 0
+fi
+
+# --------------------------------------
+# Show selected files
+# --------------------------------------
+
+echo
+if [ "$SERVICE" = "2" ] && [ "$SELECTED_COUNT" -gt 20 ]; then
+    echo
+    echo "ERROR: TempFile allows a maximum of 20 files per request."
+    echo "Please select 20 files or fewer."
+    exit 1
+fi
+
+echo
+echo "======================================"
+echo "Selected files: $SELECTED_COUNT"
+echo "Service: $SERVICE_NAME"
+echo "======================================"
+echo
+
+for INDEX in "${SELECTED[@]}"; do
+    DISPLAY="${FILES[$INDEX]}"
+
+    if [[ "$DISPLAY" == "$TARGET/"* ]]; then
+        DISPLAY="${DISPLAY#"$TARGET"/}"
+    fi
+
+    printf "%3d. %s\n" "$((INDEX + 1))" "$DISPLAY"
+done
+
+# --------------------------------------
+# Confirm upload
+# --------------------------------------
+
+echo
+echo "======================================"
+
+read -r -p "Upload selected files? [Y/n]: " CONFIRM
+CONFIRM="${CONFIRM:-Y}"
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "Upload cancelled."
+    exit 0
+fi
+
+# --------------------------------------
+# Upload
+# --------------------------------------
+
+echo
+echo "Uploading..."
+echo
+
+SUCCESS=0
+FAILED=0
+
+URLS=()
+NAMES=()
+
+COUNT=0
+TOTAL_SELECTED=${#SELECTED[@]}
+
+for INDEX in "${SELECTED[@]}"; do
+
+    FILE="${FILES[$INDEX]}"
+    COUNT=$((COUNT + 1))
+
+    if [ "$SERVICE" = "1" ]; then
+        LINK=$(
+            curl -sS \
+                --max-time 120 \
+                -F "reqtype=fileupload" \
+                -F "fileToUpload=@$FILE" \
+                "$API_URL" |
+            tr -d '\r\n'
+        )
+    else
+        RESPONSE=$(
+            curl -sS \
+                --max-time 120 \
+                -F "files=@$FILE" \
+                -F "expiryHours=$TIME" \
+                "$API_URL"
+        )
+
+        LINK=$(printf '%s' "$RESPONSE" | sed -n 's/.*"success"[[:space:]]*:[[:space:]]*true.*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    fi
+
+    if [[ "$LINK" == https://* ]]; then
+        SUCCESS=$((SUCCESS + 1))
+        URLS+=("$LINK")
+        NAMES+=("$(basename "$FILE")")
+    else
+        FAILED=$((FAILED + 1))
+        URLS+=("")
+        NAMES+=("$(basename "$FILE")")
+    fi
+
+    # Progress bar
+    PERCENT=$((COUNT * 100 / TOTAL_SELECTED))
+    WIDTH=30
+    FILLED=$((PERCENT * WIDTH / 100))
+    EMPTY=$((WIDTH - FILLED))
+
+    BAR=$(printf '%*s' "$FILLED" '' | tr ' ' '#')
+    BAR="${BAR}$(printf '%*s' "$EMPTY" '')"
+
+    printf '\r[%s] %3d%% (%d/%d)' \
+        "$BAR" \
+        "$PERCENT" \
+        "$COUNT" \
+        "$TOTAL_SELECTED"
+done
+
+printf '\n\n'
+
+# --------------------------------------
+# Final results
+# --------------------------------------
+
+echo "======================================"
+echo "Upload complete"
+echo "======================================"
+echo
+echo "Successful: $SUCCESS"
+echo "Failed:     $FAILED"
+echo
+
+echo "Uploaded files:"
+echo "--------------------------------------"
+
+for ((i=0; i<TOTAL_SELECTED; i++)); do
+    if [ -n "${URLS[$i]}" ]; then
+        printf "%s - %s\n" \
+            "${NAMES[$i]}" \
+            "${URLS[$i]}"
+    else
+        printf "%s - FAILED\n" \
+            "${NAMES[$i]}"
+    fi
+done
+
+echo "--------------------------------------"
